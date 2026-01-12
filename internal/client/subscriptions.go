@@ -198,56 +198,64 @@ type AzureARMSubscriptionList struct {
 func (c *Client) WaitForAzureSubscription(name string, timeout time.Duration) (string, error) {
 	token, err := c.getAzureToken()
 	if err != nil {
-		return "", err
+		fmt.Printf("[ERROR] Azure authentication failed: %v\n", err)
+		return "", fmt.Errorf("azure auth failed: %w", err)
 	}
 
 	fmt.Printf("[INFO] Polling Azure ARM for subscription '%s' (timeout: %v)...\n", name, timeout)
 	
-	timeoutCh := time.After(timeout)
-	ticker := time.NewTicker(30 * time.Second) // Poll Azure every 30s to avoid rate limits
-	defer ticker.Stop()
-
+	deadline := time.Now().Add(timeout)
+	pollInterval := 30 * time.Second
+	
+	// Poll immediately, then every 30 seconds
 	for {
-		select {
-		case <-timeoutCh:
+		// Check if we've exceeded timeout
+		if time.Now().After(deadline) {
 			return "", fmt.Errorf("timeout waiting for subscription '%s' to appear in Azure", name)
-		case <-ticker.C:
-			// List subscriptions: GET https://management.azure.com/subscriptions?api-version=2022-12-01
-			req, err := http.NewRequest("GET", "https://management.azure.com/subscriptions?api-version=2022-12-01", nil)
-			if err != nil {
-				return "", err
-			}
-			req.Header.Set("Authorization", "Bearer "+token)
+		}
 
-			resp, err := c.httpClient.Do(req)
-			if err != nil {
-				fmt.Printf("[WARN] Failed to list Azure subscriptions: %v\n", err)
-				continue
-			}
-			
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				continue
-			}
+		// List subscriptions: GET https://management.azure.com/subscriptions?api-version=2022-12-01
+		req, err := http.NewRequest("GET", "https://management.azure.com/subscriptions?api-version=2022-12-01", nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 
-			if resp.StatusCode != 200 {
-				fmt.Printf("[WARN] Azure API returned status %d: %s\n", resp.StatusCode, string(body))
-				continue
-			}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			fmt.Printf("[WARN] Failed to list Azure subscriptions: %v\n", err)
+			time.Sleep(pollInterval)
+			continue
+		}
+		
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			time.Sleep(pollInterval)
+			continue
+		}
 
-			var list AzureARMSubscriptionList
-			if err := json.Unmarshal(body, &list); err != nil {
-				continue
-			}
+		if resp.StatusCode != 200 {
+			fmt.Printf("[WARN] Azure API returned status %d: %s\n", resp.StatusCode, string(body))
+			time.Sleep(pollInterval)
+			continue
+		}
 
-			for _, sub := range list.Value {
-				if sub.DisplayName == name {
-					fmt.Printf("[INFO] Found subscription in Azure! GUID: %s\n", sub.SubscriptionID)
-					return sub.SubscriptionID, nil
-				}
+		var list AzureARMSubscriptionList
+		if err := json.Unmarshal(body, &list); err != nil {
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		for _, sub := range list.Value {
+			if sub.DisplayName == name {
+				fmt.Printf("[INFO] Found subscription in Azure! GUID: %s, State: %s\n", sub.SubscriptionID, sub.State)
+				return sub.SubscriptionID, nil
 			}
 		}
+
+		fmt.Printf("[INFO] Subscription '%s' not found yet. Waiting %v before next check...\n", name, pollInterval)
+		time.Sleep(pollInterval)
 	}
 }
 // FindAzureSubscriptionByName searches for a subscription by name in an Azure Plan
