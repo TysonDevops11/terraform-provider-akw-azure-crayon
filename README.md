@@ -22,7 +22,7 @@ go build -o terraform-provider-crayon
 ```hcl
 provider_installation {
   dev_overrides {
-    "local/crayon" = "/Users/quang2206/Coding/tfprovider"
+    "local/crayon" = "<YOUR LOCAL PATH TO THE PROVIDER>"
   }
   direct {}
 }
