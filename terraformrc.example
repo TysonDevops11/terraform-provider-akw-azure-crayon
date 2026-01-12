@@ -1,9 +1,0 @@
-# Local Development Configuration
-# This file tells Terraform to use your locally-built provider instead of downloading from registry
-
-provider_installation {
-  dev_overrides {
-    "local/crayon" = "/Users/quang2206/Coding/tfprovider"
-  }
-  direct {}
-}
