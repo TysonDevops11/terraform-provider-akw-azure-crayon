@@ -157,21 +157,34 @@ func (c *Client) pollForSubscription(azurePlanID int, name string, timeout time.
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
+	pollCount := 0
+	fmt.Printf("[DEBUG] Starting to poll for subscription '%s' under Azure Plan %d (timeout: %v)\n", name, azurePlanID, timeout)
+
 	for {
 		select {
 		case <-timeoutCh:
-			return nil, fmt.Errorf("timeout waiting for subscription '%s' to be created", name)
+			return nil, fmt.Errorf("timeout waiting for subscription '%s' to be created (polled %d times)", name, pollCount)
 		case <-ticker.C:
+			pollCount++
+			fmt.Printf("[DEBUG] Poll #%d: Checking for subscription '%s'...\n", pollCount, name)
+
 			subs, err := c.GetAzureSubscriptions(azurePlanID)
 			if err != nil {
+				fmt.Printf("[DEBUG] Poll #%d: Error getting subscriptions: %v\n", pollCount, err)
 				continue
 			}
 
-			for _, sub := range subs {
+			fmt.Printf("[DEBUG] Poll #%d: Found %d subscriptions in Azure Plan %d:\n", pollCount, len(subs), azurePlanID)
+			for i, sub := range subs {
+				fmt.Printf("[DEBUG]   [%d] ID=%d, Name='%s', Status='%s', AzureGUID='%s'\n",
+					i+1, sub.ID, sub.FriendlyName, sub.Status, sub.SubscriptionID)
+
 				if sub.FriendlyName == name {
+					fmt.Printf("[DEBUG] Poll #%d: MATCH FOUND! Subscription '%s' created with ID %d\n", pollCount, name, sub.ID)
 					return c.GetAzureSubscription(azurePlanID, sub.ID)
 				}
 			}
+			fmt.Printf("[DEBUG] Poll #%d: No match for '%s' yet, will retry in 15 seconds...\n", pollCount, name)
 		}
 	}
 }
