@@ -1,0 +1,22 @@
+# Binaries
+terraform-provider-*
+!terraform-provider-*.go
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Test files
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# GPG keys (never commit these!)
+*.key
+private.key
+public.key
