@@ -31,12 +31,15 @@ type CrayonProvider struct {
 
 // CrayonProviderModel describes the provider data model.
 type CrayonProviderModel struct {
-	BaseURL        types.String `tfsdk:"base_url"`
-	ClientID       types.String `tfsdk:"client_id"`
-	ClientSecret   types.String `tfsdk:"client_secret"`
-	Username       types.String `tfsdk:"username"`
-	Password       types.String `tfsdk:"password"`
-	OrganizationID types.Int64  `tfsdk:"organization_id"`
+	BaseURL           types.String `tfsdk:"base_url"`
+	ClientID          types.String `tfsdk:"client_id"`
+	ClientSecret      types.String `tfsdk:"client_secret"`
+	Username          types.String `tfsdk:"username"`
+	Password          types.String `tfsdk:"password"`
+	OrganizationID    types.Int64  `tfsdk:"organization_id"`
+	AzureClientID     types.String `tfsdk:"azure_client_id"`
+	AzureClientSecret types.String `tfsdk:"azure_client_secret"`
+	AzureTenantID     types.String `tfsdk:"azure_tenant_id"`
 }
 
 func (p *CrayonProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -72,6 +75,19 @@ func (p *CrayonProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 			},
 			"organization_id": schema.Int64Attribute{
 				Description: "Crayon Organization ID. Can also be set via CRAYON_ORGANIZATION_ID environment variable. Defaults to 4051878.",
+				Optional:    true,
+			},
+			"azure_client_id": schema.StringAttribute{
+				Description: "Azure Service Principal Client ID for direct subscription querying. Can also be set via ARM_CLIENT_ID.",
+				Optional:    true,
+			},
+			"azure_client_secret": schema.StringAttribute{
+				Description: "Azure Service Principal Client Secret for direct subscription querying. Can also be set via ARM_CLIENT_SECRET.",
+				Optional:    true,
+				Sensitive:   true,
+			},
+			"azure_tenant_id": schema.StringAttribute{
+				Description: "Azure Tenant ID for direct subscription querying. Can also be set via ARM_TENANT_ID.",
 				Optional:    true,
 			},
 		},
@@ -119,6 +135,22 @@ func (p *CrayonProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		}
 	}
 
+	// Azure Credentials for direct querying (Optional but recommended for faster updates)
+	azureClientID := getConfigValue(config.AzureClientID.ValueString(), "ARM_CLIENT_ID", "")
+	azureClientSecret := getConfigValue(config.AzureClientSecret.ValueString(), "ARM_CLIENT_SECRET", "")
+	azureTenantID := getConfigValue(config.AzureTenantID.ValueString(), "ARM_TENANT_ID", "")
+
+	// Validate Azure credentials if partially set
+	if (azureClientID != "" || azureClientSecret != "" || azureTenantID != "") &&
+		(azureClientID == "" || azureClientSecret == "" || azureTenantID == "") {
+		resp.Diagnostics.AddWarning(
+			"Incomplete Azure Configuration",
+			"To enable direct Azure subscription polling, all three Azure credentials must be provided: "+
+				"azure_client_id, azure_client_secret, and azure_tenant_id (or via ARM_* env vars). "+
+				"Falling back to Crayon-only polling (slower).",
+		)
+	}
+
 	// Validate required configuration
 	if clientID == "" {
 		resp.Diagnostics.AddError(
@@ -141,16 +173,20 @@ func (p *CrayonProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		"base_url":        baseURL,
 		"organization_id": organizationID,
 		"has_username":    username != "",
+		"has_azure_creds": azureClientID != "",
 	})
 
 	// Create client with dual-auth support
 	crayonClient, err := client.NewClient(client.ClientConfig{
-		BaseURL:        baseURL,
-		ClientID:       clientID,
-		ClientSecret:   clientSecret,
-		Username:       username,
-		Password:       password,
-		OrganizationID: organizationID,
+		BaseURL:           baseURL,
+		ClientID:          clientID,
+		ClientSecret:      clientSecret,
+		Username:          username,
+		Password:          password,
+		OrganizationID:    organizationID,
+		AzureClientID:     azureClientID,
+		AzureClientSecret: azureClientSecret,
+		AzureTenantID:     azureTenantID,
 	})
 	if err != nil {
 		resp.Diagnostics.AddError(
