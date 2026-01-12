@@ -4,7 +4,9 @@
 package client
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -70,7 +72,9 @@ func (c *Client) GetAzureSubscription(azurePlanID, subscriptionID int) (*AzureSu
 }
 
 // CreateAzureSubscription creates a new Azure subscription under an Azure Plan
-func (c *Client) CreateAzureSubscription(azurePlanID int, name string, timeout time.Duration) (*AzureSubscription, error) {
+// Uses fire-and-forget approach: returns immediately when API accepts the request (202)
+// The subscription will be created asynchronously by Azure/Crayon
+func (c *Client) CreateAzureSubscription(azurePlanID int, name string) (*AzureSubscription, error) {
 	path := fmt.Sprintf("/api/v1/azureplans/%d/azuresubscriptions", azurePlanID)
 
 	reqBody := CreateAzureSubscriptionRequest{
@@ -85,8 +89,35 @@ func (c *Client) CreateAzureSubscription(azurePlanID int, name string, timeout t
 	var result AzureSubscription
 	err = parseResponse(resp, &result)
 
+	// 202 Accepted means the request was accepted but subscription creation is async
 	if err == ErrAccepted {
-		return c.pollForSubscription(azurePlanID, name, timeout)
+		fmt.Printf("[INFO] Subscription creation request accepted (HTTP 202). The subscription '%s' is being provisioned.\n", name)
+		
+		// Always try to poll Azure directly (uses SP if configured, falls back to CLI)
+		fmt.Printf("[INFO] Polling Azure ARM to confirm subscription creation...\n")
+		guid, pollErr := c.WaitForAzureSubscription(name, 20*time.Minute)
+		if pollErr == nil {
+			// Found in Azure!
+			fmt.Printf("[INFO] Successfully confirmed subscription creation in Azure. GUID: %s\n", guid)
+			return &AzureSubscription{
+				ID:             0,          // Still unknown until synced to Crayon
+				FriendlyName:   name,
+				SubscriptionID: guid,       // Real Azure GUID
+				Status:         "active",   // Valid in Azure
+				AzurePlanID:    azurePlanID,
+			}, nil
+		}
+		
+		fmt.Printf("[WARN] Failed to confirm subscription in Azure: %v. Falling back to pending state.\n", pollErr)
+		fmt.Printf("[INFO] Note: It may take several minutes for the subscription to appear in Cloud-iQ after Azure provisions it.\n")
+		fmt.Printf("[INFO] You can click 'Synchronize' in Cloud-iQ portal or run 'terraform refresh' later to update the state.\n")
+		return &AzureSubscription{
+			ID:             0,              // Will be populated after sync
+			FriendlyName:   name,
+			SubscriptionID: "pending",      // Azure GUID not yet available
+			Status:         "provisioning", // Indicate it's being created
+			AzurePlanID:    azurePlanID,
+		}, nil
 	}
 
 	if err != nil {
@@ -151,40 +182,87 @@ func (c *Client) EnableAzureSubscription(azurePlanID, subscriptionID int) error 
 	return nil
 }
 
-// pollForSubscription polls for a subscription by name with configurable timeout
-func (c *Client) pollForSubscription(azurePlanID int, name string, timeout time.Duration) (*AzureSubscription, error) {
-	timeoutCh := time.After(timeout)
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+// AzureARMSubscription represents a subscription from Azure ARM API
+type AzureARMSubscription struct {
+	SubscriptionID string `json:"subscriptionId"`
+	DisplayName    string `json:"displayName"`
+	State          string `json:"state"`
+}
 
-	pollCount := 0
-	fmt.Printf("[DEBUG] Starting to poll for subscription '%s' under Azure Plan %d (timeout: %v)\n", name, azurePlanID, timeout)
+type AzureARMSubscriptionList struct {
+	Value []AzureARMSubscription `json:"value"`
+}
+
+// WaitForAzureSubscription polls Azure ARM for a subscription with the given name
+// Returns the Azure Subscription GUID if found
+func (c *Client) WaitForAzureSubscription(name string, timeout time.Duration) (string, error) {
+	token, err := c.getAzureToken()
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Printf("[INFO] Polling Azure ARM for subscription '%s' (timeout: %v)...\n", name, timeout)
+	
+	timeoutCh := time.After(timeout)
+	ticker := time.NewTicker(30 * time.Second) // Poll Azure every 30s to avoid rate limits
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-timeoutCh:
-			return nil, fmt.Errorf("timeout waiting for subscription '%s' to be created (polled %d times)", name, pollCount)
+			return "", fmt.Errorf("timeout waiting for subscription '%s' to appear in Azure", name)
 		case <-ticker.C:
-			pollCount++
-			fmt.Printf("[DEBUG] Poll #%d: Checking for subscription '%s'...\n", pollCount, name)
-
-			subs, err := c.GetAzureSubscriptions(azurePlanID)
+			// List subscriptions: GET https://management.azure.com/subscriptions?api-version=2022-12-01
+			req, err := http.NewRequest("GET", "https://management.azure.com/subscriptions?api-version=2022-12-01", nil)
 			if err != nil {
-				fmt.Printf("[DEBUG] Poll #%d: Error getting subscriptions: %v\n", pollCount, err)
+				return "", err
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			resp, err := c.httpClient.Do(req)
+			if err != nil {
+				fmt.Printf("[WARN] Failed to list Azure subscriptions: %v\n", err)
+				continue
+			}
+			
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
 				continue
 			}
 
-			fmt.Printf("[DEBUG] Poll #%d: Found %d subscriptions in Azure Plan %d:\n", pollCount, len(subs), azurePlanID)
-			for i, sub := range subs {
-				fmt.Printf("[DEBUG]   [%d] ID=%d, Name='%s', Status='%s', AzureGUID='%s'\n",
-					i+1, sub.ID, sub.FriendlyName, sub.Status, sub.SubscriptionID)
+			if resp.StatusCode != 200 {
+				fmt.Printf("[WARN] Azure API returned status %d: %s\n", resp.StatusCode, string(body))
+				continue
+			}
 
-				if sub.FriendlyName == name {
-					fmt.Printf("[DEBUG] Poll #%d: MATCH FOUND! Subscription '%s' created with ID %d\n", pollCount, name, sub.ID)
-					return c.GetAzureSubscription(azurePlanID, sub.ID)
+			var list AzureARMSubscriptionList
+			if err := json.Unmarshal(body, &list); err != nil {
+				continue
+			}
+
+			for _, sub := range list.Value {
+				if sub.DisplayName == name {
+					fmt.Printf("[INFO] Found subscription in Azure! GUID: %s\n", sub.SubscriptionID)
+					return sub.SubscriptionID, nil
 				}
 			}
-			fmt.Printf("[DEBUG] Poll #%d: No match for '%s' yet, will retry in 15 seconds...\n", pollCount, name)
 		}
 	}
+}
+// FindAzureSubscriptionByName searches for a subscription by name in an Azure Plan
+// Returns the subscription if found, or an error if not found
+func (c *Client) FindAzureSubscriptionByName(azurePlanID int, name string) (*AzureSubscription, error) {
+	subs, err := c.GetAzureSubscriptions(azurePlanID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get subscriptions: %w", err)
+	}
+
+	for _, sub := range subs {
+		if sub.FriendlyName == name {
+			return &sub, nil
+		}
+	}
+
+	return nil, fmt.Errorf("subscription '%s' not found in Azure Plan %d", name, azurePlanID)
 }

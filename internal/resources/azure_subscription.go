@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"time"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -121,18 +121,10 @@ func (r *AzureSubscriptionResource) Create(ctx context.Context, req resource.Cre
 		"name":          data.Name.ValueString(),
 	})
 
-	// Determine timeout (default 10 minutes)
-	timeoutMinutes := int(data.CreateTimeout.ValueInt64())
-	if timeoutMinutes <= 0 {
-		timeoutMinutes = 10
-	}
-	timeout := time.Duration(timeoutMinutes) * time.Minute
-
-	// Create the subscription via Crayon API
+	// Create the subscription via Crayon API (fire-and-forget approach)
 	subscription, err := r.client.CreateAzureSubscription(
 		int(data.AzurePlanID.ValueInt64()),
 		data.Name.ValueString(),
-		timeout,
 	)
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -143,13 +135,26 @@ func (r *AzureSubscriptionResource) Create(ctx context.Context, req resource.Cre
 	}
 
 	// Map response to model
-	data.ID = types.StringValue(strconv.Itoa(subscription.ID))
+	// Note: For async creation (202), ID will be 0 and SubscriptionID will be "pending"
+	if subscription.ID == 0 {
+		// Async creation - use name as temporary ID and add warning
+		data.ID = types.StringValue("pending-" + data.Name.ValueString())
+		resp.Diagnostics.AddWarning(
+			"Subscription Creation In Progress",
+			"The subscription creation request was accepted but is being provisioned asynchronously. "+
+				"The subscription will appear in Cloud-iQ after Azure provisions it and Cloud-iQ syncs. "+
+				"You can click 'Synchronize' in the Cloud-iQ portal or run 'terraform refresh' later to update the state.",
+		)
+	} else {
+		data.ID = types.StringValue(strconv.Itoa(subscription.ID))
+	}
 	data.SubscriptionID = types.StringValue(subscription.SubscriptionID)
 	data.Status = types.StringValue(subscription.Status)
 
 	tflog.Info(ctx, "Created Azure subscription", map[string]interface{}{
 		"id":              subscription.ID,
 		"subscription_id": subscription.SubscriptionID,
+		"status":          subscription.Status,
 	})
 
 	// Save data into Terraform state
@@ -165,8 +170,50 @@ func (r *AzureSubscriptionResource) Read(ctx context.Context, req resource.ReadR
 		return
 	}
 
-	// Parse ID
-	subscriptionID, err := strconv.Atoi(data.ID.ValueString())
+	idValue := data.ID.ValueString()
+	azurePlanID := int(data.AzurePlanID.ValueInt64())
+
+	// Check if this is a pending subscription (created async, not yet synced)
+	if strings.HasPrefix(idValue, "pending-") {
+		subscriptionName := strings.TrimPrefix(idValue, "pending-")
+		tflog.Debug(ctx, "Checking for pending subscription sync", map[string]interface{}{
+			"name":          subscriptionName,
+			"azure_plan_id": azurePlanID,
+		})
+
+		// Try to find the subscription by name in Cloud-iQ
+		subscription, err := r.client.FindAzureSubscriptionByName(azurePlanID, subscriptionName)
+		if err != nil {
+			// Subscription not yet synced - keep the pending state
+			tflog.Info(ctx, "Subscription not yet synced to Cloud-iQ", map[string]interface{}{
+				"name": subscriptionName,
+			})
+			resp.Diagnostics.AddWarning(
+				"Subscription Still Pending",
+				"The subscription '"+subscriptionName+"' has not yet appeared in Cloud-iQ. "+
+					"Please click 'Synchronize' in the Cloud-iQ portal or wait for automatic sync, then run 'terraform refresh'.",
+			)
+			// Keep current state as-is
+			resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+			return
+		}
+
+		// Subscription found! Update the state with real values
+		tflog.Info(ctx, "Subscription synced to Cloud-iQ", map[string]interface{}{
+			"id":              subscription.ID,
+			"subscription_id": subscription.SubscriptionID,
+		})
+		data.ID = types.StringValue(strconv.Itoa(subscription.ID))
+		data.SubscriptionID = types.StringValue(subscription.SubscriptionID)
+		data.Status = types.StringValue(subscription.Status)
+		data.Name = types.StringValue(subscription.FriendlyName)
+
+		resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+		return
+	}
+
+	// Normal read for non-pending subscriptions
+	subscriptionID, err := strconv.Atoi(idValue)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Reading Azure Subscription",
@@ -177,18 +224,15 @@ func (r *AzureSubscriptionResource) Read(ctx context.Context, req resource.ReadR
 
 	tflog.Debug(ctx, "Reading Azure subscription", map[string]interface{}{
 		"id":            subscriptionID,
-		"azure_plan_id": data.AzurePlanID.ValueInt64(),
+		"azure_plan_id": azurePlanID,
 	})
 
 	// Get subscription from API
-	subscription, err := r.client.GetAzureSubscription(
-		int(data.AzurePlanID.ValueInt64()),
-		subscriptionID,
-	)
+	subscription, err := r.client.GetAzureSubscription(azurePlanID, subscriptionID)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Reading Azure Subscription",
-			"Could not read subscription ID "+data.ID.ValueString()+": "+err.Error(),
+			"Could not read subscription ID "+idValue+": "+err.Error(),
 		)
 		return
 	}
@@ -213,8 +257,20 @@ func (r *AzureSubscriptionResource) Update(ctx context.Context, req resource.Upd
 		return
 	}
 
+	idValue := state.ID.ValueString()
+
+	// Check if this is still a pending subscription
+	if strings.HasPrefix(idValue, "pending-") {
+		resp.Diagnostics.AddError(
+			"Cannot Update Pending Subscription",
+			"The subscription has not yet synced to Cloud-iQ. Please run 'terraform refresh' after "+
+				"clicking 'Synchronize' in Cloud-iQ portal, then try the update again.",
+		)
+		return
+	}
+
 	// Parse ID
-	subscriptionID, err := strconv.Atoi(state.ID.ValueString())
+	subscriptionID, err := strconv.Atoi(idValue)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Updating Azure Subscription",
@@ -283,8 +339,25 @@ func (r *AzureSubscriptionResource) Delete(ctx context.Context, req resource.Del
 		return
 	}
 
+	idValue := data.ID.ValueString()
+
+	// Check if this is a pending subscription
+	if strings.HasPrefix(idValue, "pending-") {
+		// Pending subscription - can't cancel via API since we don't have the Crayon ID
+		// Just remove from state. The subscription may or may not exist in Azure.
+		tflog.Warn(ctx, "Deleting pending subscription from state only (no Crayon ID available)", map[string]interface{}{
+			"name": data.Name.ValueString(),
+		})
+		resp.Diagnostics.AddWarning(
+			"Subscription Removed From State Only",
+			"The subscription was still pending sync to Cloud-iQ. It has been removed from Terraform state "+
+				"but may still exist in Azure. Check Azure portal and Cloud-iQ to verify.",
+		)
+		return
+	}
+
 	// Parse ID
-	subscriptionID, err := strconv.Atoi(data.ID.ValueString())
+	subscriptionID, err := strconv.Atoi(idValue)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Deleting Azure Subscription",

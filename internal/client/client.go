@@ -18,20 +18,25 @@ var ErrAccepted = errors.New("request accepted")
 
 // ClientConfig holds the configuration for the Crayon API client
 type ClientConfig struct {
-	BaseURL        string
-	ClientID       string
-	ClientSecret   string
-	Username       string
-	Password       string
-	OrganizationID int64
+	BaseURL           string
+	ClientID          string
+	ClientSecret      string
+	Username          string
+	Password          string
+	OrganizationID    int64
+	AzureClientID     string
+	AzureClientSecret string
+	AzureTenantID     string
 }
 
 // Client is the Crayon API client
 type Client struct {
-	config     ClientConfig
-	httpClient *http.Client
-	token      string
-	tokenExp   time.Time
+	config        ClientConfig
+	httpClient    *http.Client
+	token         string
+	tokenExp      time.Time
+	azureToken    string
+	azureTokenExp time.Time
 }
 
 // NewClient creates a new Crayon API client
